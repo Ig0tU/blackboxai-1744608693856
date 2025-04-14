@@ -1,0 +1,13 @@
+gradio
+aiohttp
+GitPython
+plotly
+flask
+python-dotenv
+websockets
+markdown2
+hdbscan
+requests
+transformers
+tqdm
+SpeechRecognition
