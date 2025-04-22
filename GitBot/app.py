@@ -135,15 +135,19 @@ class IssueManager:
             
             # Fetch issues using API with proper authentication
             headers = {
-                "Authorization": f"token {github_token}",
+                "Authorization": f"token {github_token}" if github_token else "",
                 "Accept": "application/vnd.github.v3+json"
             }
             
             async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(f"{GITHUB_API}/{repo_url}/issues?state=all&per_page=100") as response:
                     if response.status != 200:
-                        error_data = await response.json()
-                        return False, f"GitHub API error: {error_data.get('message', 'Unknown error')}"
+                        try:
+                            error_data = await response.json()
+                            error_message = error_data.get('message', 'Unknown error')
+                        except Exception:
+                            error_message = 'Unknown error'
+                        return False, f"GitHub API error: {error_message}"
                     
                     issues = await response.json()
                     if not isinstance(issues, list):
