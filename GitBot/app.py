@@ -33,9 +33,18 @@ GITHUB_API = "https://api.github.com/repos"
 HF_INFERENCE_API = "https://api-inference.huggingface.co/models"
 WEBHOOK_PORT = 8002  # Changed from 8000 to avoid conflict with Gradio
 WS_PORT = 8001
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
+
+# Load tokens from environment variables
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 HF_MODELS = {
     "Mistral-8x7B": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -124,20 +133,27 @@ class IssueManager:
             self.github_token = github_token
             self.hf_token = hf_token
             
-            # Clone repository using HTTPS URL
-            clone_url = f"https://github.com/{repo_url}.git"
-            repo_path = WORKSPACE / "repo"
-            if repo_path.exists():
-                shutil.rmtree(repo_path)
-            self.repo = Repo.clone_from(clone_url, repo_path)
+            # Fetch issues using API with proper authentication
+            headers = {
+                "Authorization": f"token {github_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
             
-            # Fetch issues using API
-            headers = {"Authorization": f"token {github_token}"}
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(f"{GITHUB_API}/{repo_url}/issues") as response:
+                async with session.get(f"{GITHUB_API}/{repo_url}/issues?state=all&per_page=100") as response:
+                    if response.status != 200:
+                        error_data = await response.json()
+                        return False, f"GitHub API error: {error_data.get('message', 'Unknown error')}"
+                    
                     issues = await response.json()
+                    if not isinstance(issues, list):
+                        return False, "Invalid response format from GitHub API"
+                    
+                    # Clear existing issues and store new ones
+                    self.issues.clear()
                     for issue in issues:
-                        self.issues[issue['number']] = issue
+                        if isinstance(issue, dict) and 'number' in issue:
+                            self.issues[issue['number']] = issue
             await self._cluster_similar_issues()
             logger.info(f"Successfully crawled issues: {len(self.issues)} found and clustered into {len(self.issue_clusters)} groups")
             return True, f"Found {len(self.issues)} issues (clustered into {len(self.issue_clusters)} groups)"
@@ -318,38 +334,51 @@ def create_ui() -> gr.Blocks:
             outputs=[issue_num, issue_viz]
         )
 
-        async def handle_crawl(repo, token, hf_token):
+        def handle_crawl(repo, token, hf_token):
             # Clean and parse repository URL
             clean_url = repo.replace("https://github.com/", "").strip("/")
             if "/" not in clean_url:
                 return [], None
+
+            try:
+                # Create a new event loop in this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 
-            success, message = await manager.crawl_issues(clean_url, token, hf_token)
-            if success:
-                # Create a plot showing issue statistics
-                stats_data = {
-                    "Critical": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "critical" for label in i.get("labels", []))]),
-                    "High": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "high" for label in i.get("labels", []))]),
-                    "Medium": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "medium" for label in i.get("labels", []))]),
-                    "Low": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "low" for label in i.get("labels", []))])
-                }
-                fig = go.Figure(data=[go.Bar(x=list(stats_data.keys()), y=list(stats_data.values()))])
-                fig.update_layout(title="Issue Severity Distribution")
+                # Run the async crawl_issues function
+                success, message = loop.run_until_complete(manager.crawl_issues(clean_url, token, hf_token))
                 
-                # Prepare issue list data
-                issues_data = []
-                for num, issue in manager.issues.items():
-                    if not isinstance(issue, dict):
-                        continue
-                    severity = next((sev for sev, terms in manager.severity_rules.items() 
-                                   if any(term in issue.get("title", "").lower() for term in terms)), "Medium")
-                    cluster = next((cid for cid, issues in manager.issue_clusters.items() 
-                                  if num in issues), -1)
-                    issues_data.append([num, issue.get("title", ""), severity, cluster])
-                
-                return issues_data, fig
-            else:
+                if success:
+                    # Create a plot showing issue statistics
+                    stats_data = {
+                        "Critical": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "critical" for label in i.get("labels", []))]),
+                        "High": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "high" for label in i.get("labels", []))]),
+                        "Medium": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "medium" for label in i.get("labels", []))]),
+                        "Low": len([i for i in manager.issues.values() if isinstance(i, dict) and any(label.lower() == "low" for label in i.get("labels", []))])
+                    }
+                    fig = go.Figure(data=[go.Bar(x=list(stats_data.keys()), y=list(stats_data.values()))])
+                    fig.update_layout(title="Issue Severity Distribution")
+                    
+                    # Prepare issue list data
+                    issues_data = []
+                    for num, issue in manager.issues.items():
+                        if not isinstance(issue, dict):
+                            continue
+                        severity = next((sev for sev, terms in manager.severity_rules.items() 
+                                       if any(term in issue.get("title", "").lower() for term in terms)), "Medium")
+                        cluster = next((cid for cid, issues in manager.issue_clusters.items() 
+                                      if num in issues), -1)
+                        issues_data.append([num, issue.get("title", ""), severity, cluster])
+                    
+                    return issues_data, fig
+                else:
+                    print(f"Failed to crawl issues: {message}")
+                    return [], None
+            except Exception as e:
+                print(f"Error in handle_crawl: {e}")
                 return [], None
+            finally:
+                loop.close()
 
         crawl_btn.click(
             fn=handle_crawl,
